@@ -227,9 +227,9 @@ class MistralAttention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -522,7 +522,11 @@ class MistralDecoderLayer(nn.Module):
         """
         residual = hidden_states
 
+        # vllm_in = torch.load("language_model_layer_0_input.pt", weights_only=True, map_location=hidden_states.device)
+        # assert torch.all(vllm_in == hidden_states)
         hidden_states = self.input_layernorm(hidden_states)
+
+
 
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
@@ -769,14 +773,20 @@ class MistralModel(MistralPreTrainedModel):
             attention_mask, inputs_embeds, cache_position, past_key_values, use_cache, output_attentions
         )
 
+        # vllm_inputs_embeds = torch.load("inputs_embeds_post_merge.pt", weights_only=True, map_location=inputs_embeds.device).unsqueeze(0)
+        # diff = inputs_embeds - vllm_inputs_embeds
+        # print("Mean LM inputs embeds diff: ", diff.abs().mean().item())
+        # print("Max LM inputs embeds diff: ", diff.abs().max().item())
         hidden_states = inputs_embeds
+        # print("\n\nUsing VLLM states for debugging!\n\n")
+        # hidden_states = vllm_inputs_embeds
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for i, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -792,6 +802,9 @@ class MistralModel(MistralPreTrainedModel):
                     cache_position,
                 )
             else:
+                decoder_layer = decoder_layer.to("cuda")
+                hidden_states = hidden_states.to("cuda")
+                position_ids = position_ids.to("cuda")
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
@@ -801,8 +814,15 @@ class MistralModel(MistralPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                 )
+                decoder_layer = decoder_layer.to("cpu")
+
 
             hidden_states = layer_outputs[0]
+            # vllm_out = torch.load(f"language_model_hidden_states_{i}.pt", weights_only=True, map_location=hidden_states.device)
+            # vllm_residual = torch.load(f"language_model_residual_{i}.pt", weights_only=True, map_location=hidden_states.device)
+            # diff = hidden_states - (vllm_out + vllm_residual.to(torch.float32)).to(hidden_states.dtype)
+            # print(f"Mean diff after layer {i}", diff.abs().mean().item())
+            # print(f"Max diff after layer {i}", diff.abs().max().item())
 
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
@@ -810,6 +830,7 @@ class MistralModel(MistralPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
+        hidden_states = hidden_states.to("cpu")
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
@@ -983,6 +1004,7 @@ class MistralModel(MistralPreTrainedModel):
 
 class MistralForCausalLM(MistralPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
+    _tp_plan = {"lm_head": "colwise_rep"}
 
     def __init__(self, config):
         super().__init__(config)
