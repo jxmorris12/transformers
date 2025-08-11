@@ -73,6 +73,7 @@ class GptOssExperts(nn.Module):
         self.down_proj_bias = nn.Parameter(torch.empty(self.num_experts, self.hidden_size))
         self.alpha = 1.702
         self.limit = 7.0
+        self.max_token_throughput = 4096
 
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         """
@@ -103,15 +104,23 @@ class GptOssExperts(nn.Module):
                 with torch.no_grad():
                     _, token_idx = torch.where(expert_mask[expert_idx[0]])
                 current_state = hidden_states[token_idx]
-                gate_up = current_state @ self.gate_up_proj[expert_idx] + self.gate_up_proj_bias[expert_idx]
-                gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-                gate = gate.clamp(min=None, max=self.limit)
-                up = up.clamp(min=-self.limit, max=self.limit)
-                glu = gate * torch.sigmoid(gate * self.alpha)
-                gated_output = (up + 1) * glu
-                out = gated_output @ self.down_proj[expert_idx] + self.down_proj_bias[expert_idx]
-                weighted_output = out[0] * routing_weights[token_idx, expert_idx, None]
-                next_states.index_add_(0, token_idx, weighted_output.to(hidden_states.dtype))
+
+                i = 0
+                while i < current_state.shape[0]:
+                    if i > 0: print("chunked", current_state.shape)
+                    current_state_chunk = current_state[i:i+self.max_token_throughput]
+                    token_idx_chunk = token_idx[i:i+self.max_token_throughput]
+                    i += self.max_token_throughput
+                
+                    gate_up = current_state_chunk @ self.gate_up_proj[expert_idx] + self.gate_up_proj_bias[expert_idx]
+                    gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+                    gate = gate.clamp(min=None, max=self.limit)
+                    up = up.clamp(min=-self.limit, max=self.limit)
+                    glu = gate * torch.sigmoid(gate * self.alpha)
+                    gated_output = (up + 1) * glu
+                    out = gated_output @ self.down_proj[expert_idx] + self.down_proj_bias[expert_idx]
+                    weighted_output = out[0] * routing_weights[token_idx_chunk, expert_idx, None]
+                    next_states.index_add_(0, token_idx_chunk, weighted_output.to(hidden_states.dtype))
             next_states = next_states.view(batch_size, -1, self.hidden_size)
         else:
             hidden_states = hidden_states.repeat(num_experts, 1)
